@@ -167,7 +167,7 @@ def apply_beam(amps, freqs, ref_freq,  beta, beam_fwhm, freq_beam, lmax, nside, 
     return ret
 
 def amps_lhs(amps, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec, nside=128, nside_new=16, Nfreqs=22, beam_fwhm=np.deg2rad(10), lmax=None, freq_beam = 200, 
-    pixel_mask=None, parallel=False):
+    pixel_mask=None, parallel=True):
     '''
     LHS matrix multiplication with vector amps
     
@@ -254,13 +254,20 @@ def amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec, ns
 
     return first_term + second_term + third_term
 
-def calc_model_spectral(amps, freqs, gain, beta, ndata1, beam_fwhm, ref_freq, freq_beam, lmax_beam = None, nside=128, nside_new=16, pixel_mask=None):
+def calc_model_spectral(amps, freqs, gain, beta, ndata1, beam_fwhm, ref_freq, freq_beam, lmax_beam=None, nside=128, nside_new=16, pixel_mask=None):
+
     amps_npix = amps.copy()
-      
-    model1 = np.array([apply_beam(amps_npix, freqs[ff], ref_freq,  beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask=pixel_mask)  for ff in range(ndata1)])
+
+    def compute_model1(ff):
+        return apply_beam(amps_npix, freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask=pixel_mask
+        )
+
+    with ThreadPoolExecutor() as executor:
+        model1 = list(executor.map(compute_model1, range(ndata1)))
+
+    model1 = np.array(model1)
     model2 = gain * (amps_npix * (freqs[-1] / ref_freq) ** beta)
-    
-    return [model1, model2] # np.concatenate((model1, model2[np.newaxis, :]), axis=0)
+    return [model1, model2]
 
 def precompute_conv(amps, freqs, gain, ndata1, beam_fwhm, freq_beam, lmax_beam, op_spect, nside=128, nside_new=16):
 
@@ -283,19 +290,25 @@ def precompute_conv(amps, freqs, gain, ndata1, beam_fwhm, freq_beam, lmax_beam, 
     
     return [model1, model2] #np.concatenate((np.sum(model1, axis=0), model2[np.newaxis, :]), axis=0)
 
-def log_prob_haslam(beta, data, precomp, freqs, ref_freq, op_spect, var, amps, gain, beam_fwhm, lmax_beam, freq_beam, nside, nside_new, sigfig=None, pixel_mask=None, prior=False):
+def log_prob_haslam(beta, data, precomp, freqs, ref_freq, op_spect, var,
+                    amps, gain, beam_fwhm, lmax_beam, freq_beam,
+                    nside, nside_new, sigfig=None, pixel_mask=None, prior=False):
 
-    ndata1 = len(freqs[:-1])
+    nfreq = len(freqs)
+    npix = np.shape(data[1])[0]
+    npix_new = hp.nside2npix(nside_new)
 
-    if len(np.shape(op_spect)) == 2:
-        beta_ = op_spect @ beta
-    else:
-        beta_ = beta.copy()
+    # Apply operator to beta if needed
+    beta_ = op_spect @ beta if op_spect.ndim == 2 else beta.copy()
 
-    model = calc_model_spectral(amps, freqs, gain, beta_, len(data[0]), beam_fwhm, ref_freq, lmax_beam = lmax_beam, freq_beam= freq_beam, nside=nside, nside_new=nside_new, pixel_mask=pixel_mask)  
-    # np.zeros((len(freqs), np.shape(data[1])[0]))  
+    # Compute model
+    model = calc_model_spectral(amps, freqs, gain, beta_, nfreq - 1, beam_fwhm, ref_freq, freq_beam=freq_beam, lmax_beam=lmax_beam, 
+        nside=nside, nside_new=nside_new, pixel_mask=pixel_mask
+    )
 
-    # for ff in range(len(freqs)):
+    # model1 = np.zeros((nfreq, np.shape(data[0])[1]))  
+
+    # for ff in range(nfreqs):
     #     if ff<len(freqs)-1:
     #         for nn in range(len(precomp[0])):
     #             if len(np.shape(op_spect)) == 2:
@@ -304,29 +317,38 @@ def log_prob_haslam(beta, data, precomp, freqs, ref_freq, op_spect, var, amps, g
     #             else:
     #                 beta_val = beta_
 
-    #             model[ff] += precomp[0][nn, ff] * (freqs[ff] / ref_freq)** (beta_val)
+    #             model[ff:npix_new] += precomp[0][nn, ff] * (freqs[ff] / ref_freq)** (beta_val)
     #     else:
-    #         model[ff] = precomp[1] * (freqs[ff] / ref_freq)** (beta_)
-    
-    x = np.zeros((len(freqs), np.shape(data[1])[0]))
-    y = np.zeros((len(freqs), np.shape(data[1])[0]))
+    #         model2 = precomp[1] * (freqs[ff] / ref_freq)** (beta_)
+    # model = [model1, model2]
 
-    for ff in range(len(freqs)):
-        if ff < (len(freqs) - 1):
-            x[ff, :hp.nside2npix(nside_new)] = (data[0][ff] - model[0][ff])**2 / var[0]
-            if prior == True:
-                y[ff] = 1/var[0] *(freqs[ff]/ref_freq) ** (beta_) * np.log(freqs[ff]/ref_freq)
+    x = np.zeros((nfreq, npix))
+    y = np.zeros((nfreq, npix)) if prior else None
+
+    def compute_residual(ff):
+        res_x = np.zeros(npix)
+        res_y = np.zeros(npix) if prior else None
+        if ff < (nfreq - 1):
+            res_x[:npix_new] = (data[0][ff] - model[0][ff])**2 / var[0]
+            if prior:
+                res_y[:] = 1 / var[0] * (freqs[ff]/ref_freq)**beta_ * np.log(freqs[ff]/ref_freq)
         else:
-            x[ff] = (data[1] - model[1][ff])**2 / var[1]
-            if prior == True:
-                y[ff] = 1/var[1] *(freqs[ff]/ref_freq) ** (beta_) * np.log(freqs[ff]/ref_freq)
+            res_x[:] = (data[1] - model[1])**2 / var[1]
+            if prior:
+                res_y[:] = 1 / var[1] * (freqs[ff]/ref_freq)**beta_ * np.log(freqs[ff]/ref_freq)
+        return ff, res_x, res_y
 
-    if prior == True:
-        prob = -0.5 * np.sum(x) + np.log(np.sqrt(np.sum(y**2)))
-    else:
-        prob = -0.5 * np.sum(x)
-    
-    if sigfig == None:
-        return prob
-    else:
-        return np.round(prob, sigfig) * 10**(sigfig)
+    with ThreadPoolExecutor() as executor:
+        for ff, res_x, res_y in executor.map(compute_residual, range(nfreq)):
+            x[ff] = res_x
+            if prior:
+                y[ff] = res_y
+
+    prob = -0.5 * np.sum(x)
+    if prior:
+        prob += np.log(np.sqrt(np.sum(y**2)))
+
+    if sigfig is not None:
+        prob = np.round(prob, sigfig) * 10**sigfig
+
+    return prob
