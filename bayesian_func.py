@@ -19,7 +19,7 @@ import time
 import warnings
 import emcee
 from multiprocessing import Pool, Process
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 def estimate_diag_precond(lhs_op, size):
     diag = np.zeros(size)
@@ -189,30 +189,31 @@ def transpose_downsampling(map_low, nside_high, power=0):
 
     return map_high
     
-def transpose_beam(vec, freqs, ref_freq, beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask=None):
+def transpose_beam(vec, freqs, ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask=None):
     const = (freqs / ref_freq)**beta
     
-    ret =  hp.smoothing(vec , lmax=lmax, fwhm=(beam_fwhm * freq_beam/ freqs)) #beam_window=beam_vec_t)
+    ret =  hp.smoothing(vec , lmax=lmax_beam, fwhm=(beam_fwhm * freq_beam/ freqs)) #beam_window=beam_vec_t)
     
     ret[pixel_mask == 0] = 0
 
     return transpose_downsampling(ret, nside) * const
 
-def apply_beam(amps, freqs, ref_freq,  beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask=None):
+def apply_beam(amps, freqs, ref_freq,  beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask=None):
     amps_ = amps.copy()
     
     amps_ = hp.pixelfunc.ud_grade(amps_ * (freqs / ref_freq) ** beta, nside_new) 
     amps_[pixel_mask==0] = hp.UNSEEN
-    ret = hp.smoothing(amps_, fwhm=(beam_fwhm * freq_beam/ freqs), lmax=lmax)
+    ret = hp.smoothing(amps_, fwhm=(beam_fwhm * freq_beam/ freqs), lmax=lmax_beam)
     
     return ret
 
-def amps_lhs(amps, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nside, nside_new, Nfreqs, beam_fwhm, lmax, freq_beam, 
-    pixel_mask=None, parallel=True):
+def get_amps_lhs(amps, gain, all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, 
+    pixel_mask=None, parallel=False):
     '''
     LHS matrix multiplication with vector amps
     
     '''
+    Nfreqs = len(freqs)
     npix = hp.nside2npix(nside)
 
     amps_npix = amps.copy()
@@ -224,12 +225,12 @@ def amps_lhs(amps, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nsid
 
     if parallel == True:
         def process_ff(ff):
-            if ff < Nfreqs - 1:
+            if ff < (Nfreqs - 1):
                 return transpose_beam(
                     invN1 * apply_beam(
-                        amps_npix, freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask
+                        amps_npix, freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask
                     ),
-                    freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask
+                    freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask
                 )
             else:
                 scale = gain * ((freqs[ff] / ref_freq) ** beta)
@@ -246,8 +247,8 @@ def amps_lhs(amps, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nsid
 
         for ff in range(Nfreqs):
             if ff<(Nfreqs-1):
-                v += transpose_beam(invN1 * apply_beam(amps_npix, freqs[ff], ref_freq,  beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask=pixel_mask)
-                    , freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask)
+                v += transpose_beam(invN1 * apply_beam(amps_npix, freqs[ff], ref_freq,  beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+                    , freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
             else:
                 v += gain * ((freqs[ff] / ref_freq) ** beta) * invN2 * (gain * amps_npix * (freqs[ff] / ref_freq) ** beta)
 
@@ -258,10 +259,96 @@ def amps_lhs(amps, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nsid
 
     return v +  second_term * amps_npix
 
-def amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nside, nside_new, Nfreqs, beam_fwhm, lmax, freq_beam, pixel_mask=None, sprior_mean=None):
+def get_bprime_rhs(b_rhs_gcr, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None):
+    '''
+    refer to RHS of Eq. A9 in paper
+
+    This is done for only 1 frequency!
+    '''
+
+    invA0_b = invA0 * b_rhs_gcr
+
+    return apply_beam(invA0_b, freqs, ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask=pixel_mask)
+
+    
+def get_invA0(gain, covA, all_covN, freqs, ref_freq, beta):
+    x0_mtrx = gain * ((freqs[-1] / ref_freq) ** beta)
+    x0_mtrx_t = x0_mtrx
+
+    return 1 / (1 / covA + x0_mtrx_t *  1 / all_covN[1] * x0_mtrx)
+
+def get_bprime_lhs(y, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None):
+    '''
+    refer to RHS of Eq. A9 in paper
+
+    This is done for only 1 frequency!
+    '''
+
+    return all_covN[0] + apply_beam(invA0 * transpose_beam(y, freqs, ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+            , freqs, ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+
+def solve_single_frequency(ff, freqs, npix_new, b_rhs_gcr, all_covN, invA0, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None, rtol=1e-10):
+    freq = freqs[ff]
+
+    all_bprime = get_bprime_rhs(b_rhs_gcr, all_covN, invA0, freq, ref_freq, beta,
+                                 nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask)
+
+    def lhs_y_solver(y):
+        return get_bprime_lhs(y, all_covN, invA0, freq, ref_freq, beta,
+                              nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask)
+
+    lhs_matrix = linalg.LinearOperator(matvec=lhs_y_solver, shape=(int(npix_new), int(npix_new)))
+
+    y, info = linalg.bicgstab(A=lhs_matrix, b=all_bprime, maxiter=int(1e3), rtol=rtol)
+
+    return ff, y
+
+def solve_ally_parallel(b_rhs_gcr, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None):
+    npix_new = hp.nside2npix(nside_new)
+
+    all_y = np.zeros((len(freqs[:-1]), npix_new))
+
+    with ProcessPoolExecutor() as executor:
+        futures = []
+        for ff in range(len(freqs[:-1])):
+            futures.append(executor.submit(
+                solve_single_frequency, ff, freqs, npix_new, b_rhs_gcr, all_covN, invA0,
+                ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask
+            ))
+
+        for future in futures:
+            ff, y = future.result()
+            all_y[ff] = y
+
+    return all_y
+
+def solve_amps(all_y, b_rhs_gcr, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None):
+
+    sumXt_y = 0
+
+    for ff in range(len(freqs[:-1])):
+        sumXt_y += transpose_beam(all_y[ff], freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+
+    return invA0 * (b_rhs_gcr - sumXt_y)
+
+def check_ax(amps, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None):
+
+    amps_npix = amps.copy()
+    npix = hp.nside2npix(nside)
+    v = np.zeros(npix)
+    invN1 = 1 / all_covN[0]
+
+    for ff in range(len(freqs[:-1])):
+        v += transpose_beam(invN1 * apply_beam(amps_npix, freqs[ff], ref_freq,  beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+            , freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+
+    return 1 / invA0 * amps_npix + v      
+
+def get_amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, pixel_mask=None, sprior_mean=None, map_soln_only=False):
     '''
     RHS vector
     '''
+    Nfreqs = len(freqs)
     invN1 = 1 / (all_covN[0])
     invN2 = 1 / (all_covN[1])
     
@@ -280,18 +367,22 @@ def amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, 
 
             omega_n[pixel_mask==0] = 0
 
-            first_term += transpose_beam( invN1 * all_data[0][ff], freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask)
-            second_term += transpose_beam( invN1**0.5 * omega_n, freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax, nside, nside_new, pixel_mask)
+            first_term += transpose_beam( invN1 * all_data[0][ff], freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+            second_term += transpose_beam( invN1**0.5 * omega_n, freqs[ff], ref_freq, beta, beam_fwhm, freq_beam, lmax_beam, nside, nside_new, pixel_mask)
+
         else:
             omega_n = np.random.normal(0, 1, np.shape(all_data[1])[0])
             first_term += gain * ((freqs[ff] / ref_freq) ** beta) * (invN2 * all_data[1])
-            second_term += gain * ((freqs[ff] / ref_freq) ** beta) * (invN2**0.5 * omega_n[ff]) #
+            second_term += gain * ((freqs[ff] / ref_freq) ** beta) * (invN2**0.5 * omega_n) #
  
     third_term = 1 / (covA)**0.5 * omega_a
     third_term[np.isnan(third_term)] = 0
     third_term[np.isinf(third_term)] = 0
 
-    return first_term + second_term + third_term + 1 / (covA) * sprior_mean
+    if map_soln_only == True:
+        return first_term + 1 / (covA) * sprior_mean
+    else:
+        return first_term + second_term + third_term + 1 / (covA) * sprior_mean
 
 def calc_model_spectral(amps, freqs, gain, beta, ndata1, beam_fwhm, ref_freq, freq_beam, lmax_beam=None, nside=128, nside_new=16, pixel_mask=None):
 

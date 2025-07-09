@@ -74,7 +74,7 @@ freq_beam = data["freq_beam"]
 
 if op_alm == False:
     data2 = data["sky_gain"]
-    gain = data["gain"]
+    gain = data["gain"] + 1
     operator = data["operator"]
     covG = np.eye(np.shape(operator)[-1]) * (0.1 * (1 + gain))**2 #  0.05 **2 #  0.05**2 #
 else:
@@ -93,7 +93,7 @@ else:
     covG = np.ones(2*len_alms) * (0.15 * gain.flatten())**2
     operator = None
 
-print(1 + gain, flush=True)
+print(gain, flush=True)
 
 # generate noise for data
 sig_noise1 = sig1 * 1e-3
@@ -129,8 +129,17 @@ covN2 *= noise2
 
 print("min and max amp noise ", np.min(x1), np.max(x1), np.min(x2), np.max(x2))
 
+fdiff = 2
+freq_indx = np.arange(0, 20 + fdiff, fdiff)
+
+# freqs = freqs[freq_indx]
+# data1 = data1[freq_indx]
+
 def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, beta, true_s, ref_freq, indx_ref, beam_fwhm, nstart=0, 
     file_s0 = None, mu_g = 0, nside=128, nside_new=16, lmax_gain=10, lmax_beam = 150, op_alm=False, freq_beam=100, include_sprior=True):
+    
+    npix = hp.nside2npix(nside)
+    npix_new = hp.nside2npix(nside_new)
 
     all_data = [data1, data2] #np.concatenate((data1, data2[np.newaxis, :]), axis=0)
     
@@ -139,10 +148,24 @@ def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, be
     # set initial s
     true_s = true_s.copy()
 
+    covA = (0.1 * true_s)**2
+    covS = covA
+    sprior_mean = 0 #true_s #np.load(fdir + "sprior_mean.npy") #np.random.normal(true_s, covA, len(true_s))
+    # np.save(fdir + "sprior_mean", sprior_mean)
+
     if nstart == 0:
         s0 = true_s.copy() #+ np.random.normal(0, 10, true_s.shape)
-        sx0 = data2
         gx0 = np.ones(len(mu_g))
+        sx0 = data2
+
+        # rhs_eqn = get_amps_rhs(all_data, np.ones(npix), all_covN, covA, freqs, ref_freq, beta, 0, 
+        #     nside, nside_new, beam_fwhm, lmax_beam, freq_beam, sprior_mean=sprior_mean)
+
+        # def lhs_op_amps(v): 
+        #     return get_amps_lhs(v, np.ones(npix), all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
+        # lhs_matrix = linalg.LinearOperator(matvec=lhs_op_amps, shape=(int(npix), int(npix)))
+        # sx0, info = linalg.cgs(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-9)#, x0 = (sx0))# - np.random.normal(0, sig_noise2, np.shape(data2)))/ gain) #, rtol=1e-7
+
     else:
         try:
             data_cont = np.load(fout + file_s0)
@@ -153,11 +176,6 @@ def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, be
         except:
             print("CANNOT FIND FILE FOR S0 TO CONTINUE SAMPLING FROM NSTART=" %nstart)
             raise SystemExit
-
-    covA = (0.1 * true_s)**2
-    covS = covA
-    sprior_mean = np.load(fdir + "sprior_mean.npy") #np.random.normal(true_s, covA, len(true_s))
-    # np.save(fdir + "sprior_mean", sprior_mean)
     
     all_model_global = np.zeros((ntimes, np.shape(all_data[0])[0], np.shape(all_data[0])[1]))
     all_model_haslam = np.zeros((ntimes, np.shape(all_data[1])[0]))
@@ -172,9 +190,6 @@ def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, be
         
     chisq = np.zeros((ntimes, len(freqs), npix))
     ln_post = np.zeros(ntimes)
-
-    beam_vec = np.array([beam_window(beam_fwhm*frac, lmax_beam, extent=5) for frac in (freqs[:-1]/freq_beam)])
-    beam_vec_t = np.array([beam_window_transpose(beam_vec[ff]) for ff in range(len(freqs[:-1]))])
 
     for ii in range(ntimes):
         print("Iteration ", ii , flush=True)
@@ -206,29 +221,11 @@ def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, be
         print("rhs ", np.min(rhs_eqn_g), np.max(rhs_eqn_g), flush=True)
         print("min and max of lhs - rhs", np.min(lhs_val - rhs_eqn_g), np.max(lhs_val - rhs_eqn_g), flush=True)
 
-        # time_start_it = time.perf_counter()
-        # g, info = linalg.cgs(lhs_matrix_g, rhs_eqn_g, maxiter=int(1e3), rtol=1e-9)#, atol=1e-1)#, x0 = np.random.normal(0, 0.05, len(mu_g))) # 
-        # print(g, info)
-        # time_end = time.perf_counter()
-        # print("gain: cgs took ", time_end - time_start_it, flush=True)
-
-        # time_start_it = time.perf_counter()
-        # g, info = linalg.bicgstab(lhs_matrix_g, rhs_eqn_g, maxiter=int(2e3), rtol=1e-9, atol=1e-1)#, x0 = np.random.normal(0, 0.05, len(mu_g))) # 
-        # print(g, info)
-        # time_end = time.perf_counter()
-        # print("gain: bicgstab took ", time_end - time_start_it, flush=True)
-
         time_start_it = time.perf_counter()
         g, info = linalg.gmres(lhs_matrix_g, rhs_eqn_g, maxiter=int(1e3))#, x0 = gx0)
         print(g, info)
         time_end = time.perf_counter()
         print("gain: gmres took ", time_end - time_start_it, flush=True)
-
-        # time_start_it = time.perf_counter()
-        # g, info = linalg.minres(lhs_matrix_g, rhs_eqn_g, maxiter=int(2.5e3), rtol=1e-9)#, x0 = np.random.normal(0, 0.05, len(mu_g))) # 
-        # print(g, info)
-        # time_end = time.perf_counter()
-        # print("gain: minres took ", time_end - time_start_it, flush=True)
 
         if info>0:
             warnings.warn("Warning! Gain info: %i" %info)
@@ -239,70 +236,99 @@ def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, be
             print(g, info)
             print("gain: cgs took ", time_end - time_start_it, flush=True)
 
-        all_g[ii] = g
+        all_g[ii] = g # mu_g
 
         if op_alm == True:
             gain = 1 + hp.alm2map(g[:int(len_alms/2)] + 1j * g[int(len_alms/2):], nside, lmax=lmax_gain)
         else:
-            gain = operator @ g # + 1
+            gain = operator @ g # mu_g #
 
         ########## second part of Gibbs sampling: p(amps|...) ##############
         time_start = time.perf_counter()
 
-        rhs_eqn = amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, 
-            nside=nside, nside_new=nside_new, Nfreqs=len(freqs), beam_fwhm=beam_fwhm, lmax=lmax_beam, freq_beam = freq_beam, sprior_mean=sprior_mean)
+        rhs_eqn = get_amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam, sprior_mean=sprior_mean)
         print("Done RHS")
         print("rhs ", np.min(rhs_eqn), np.max(rhs_eqn), flush=True)
 
+        ###########################################################################################################################################
+        '''
+        Woodbury Identity version
+        '''
+        invA0 = get_invA0(gain, covA, all_covN, freqs, ref_freq, beta)
+
+        time_start = time.perf_counter()
+
+        all_y = solve_ally_parallel(rhs_eqn, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
+        time_end = time.perf_counter()
+        print("y: bicgstab took ", time_end - time_start, flush=True)
+        
+        amps = solve_amps(all_y, rhs_eqn, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
+        plt.figure()
+        hp.mollview(amps)
+        plt.savefig("amps")
+        print(amps)
+        residual = check_ax(amps, all_covN, invA0, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam) - rhs_eqn
+
+        print(residual)
+        raise SystemExit
+        
+        ###########################################################################################################################################
         def lhs_op_amps(v): 
-            return amps_lhs(v, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nside=nside, nside_new=nside_new, Nfreqs=len(freqs), beam_fwhm=beam_fwhm, lmax=lmax_beam, freq_beam = freq_beam)
+            return get_amps_lhs(v, gain, all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
 
         lhs_matrix = linalg.LinearOperator(matvec=lhs_op_amps, shape=(int(npix), int(npix)))
+
         if op_alm == False:
-            true_lhs = amps_lhs(true_s, operator @ mu_g , all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nside=nside, nside_new=nside_new, Nfreqs=len(freqs), beam_fwhm=beam_fwhm, lmax = lmax_beam, freq_beam = freq_beam)
+            true_lhs = get_amps_lhs(true_s, operator @ mu_g , all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
         else:
-            true_lhs = amps_lhs(true_s, 1 + hp.alm2map(mu_g[:int(len_alms/2)] + 1j * mu_g[int(len_alms/2):], nside, lmax=lmax_gain), all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nside=nside, nside_new=nside_new, Nfreqs=len(freqs), beam_fwhm=beam_fwhm, lmax = lmax_beam, freq_beam = freq_beam)
+            true_lhs = get_amps_lhs(true_s, 1 + hp.alm2map(mu_g[:int(len_alms/2)] + 1j * mu_g[int(len_alms/2):], nside, lmax=lmax_gain), all_covN, covA, freqs, ref_freq, beta 
+                , nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
         
-        lhs_val = amps_lhs(true_s, gain, all_covN, covA, freqs, ref_freq, beta, beam_vec_t, nside=nside, nside_new=nside_new, Nfreqs=len(freqs), beam_fwhm=beam_fwhm, lmax = lmax_beam, freq_beam = freq_beam)
+        lhs_val = get_amps_lhs(true_s, gain, all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
 
         print("true lhs ", np.min(true_lhs), np.max(true_lhs), flush=True)
         print("lhs ", np.min(lhs_val), np.max(lhs_val), flush=True)
 
         print("min and max of lhs - rhs", np.min(lhs_val - rhs_eqn), np.max(lhs_val - rhs_eqn), flush=True)
 
-        time_start = time.perf_counter()
-        amps, info = linalg.cgs(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), x0 = sx0 - np.random.normal(0, sig_noise2, np.shape(data2)))
+        if ii ==0:
+            x0 = data2 #(sx0 - np.random.normal(0, sig_noise2, np.shape(data2)))/gain
+        else:
+            x0 = all_s[int(ii-1)]
 
+        time_start = time.perf_counter()
+        amps, info = linalg.cgs(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-10)#, x0 = x0)
         time_end = time.perf_counter()
         print("amplitude: cgs took ", time_end - time_start, flush=True)
+        print("Min and max diff of signal amplitude", np.min(amps - true_s ), np.max(amps - true_s ), flush=True)
+
         print("Min and max frac diff of signal amplitude", np.min((amps - true_s)/true_s), np.max((amps - true_s)/true_s), flush=True)
 
         # time_start = time.perf_counter()
-        # amps, info = linalg.bicgstab(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3))#, rtol=1e-9, atol=1e-1)#, x0 = s0[-1])#, rtol=1e-9)# atol=1e-1)#, M = np.linalg.pinv(lhs_matrix))
+        # amps, info = linalg.bicgstab(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-6, x0 = sx0/gain)
         # time_end = time.perf_counter()
         # print("amplitude: bicgstab took ", time_end - time_start, flush=True)
         # print("Min and max diff of signal amplitude", np.min(amps - true_s ), np.max(amps - true_s ), flush=True)
 
         # time_start = time.perf_counter()
-        # amps, info = linalg.gmres(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3))#, rtol=1e-9, atol=1e-1)#, x0 = s0[-1])#, rtol=1e-9)# atol=1e-1)#, M = np.linalg.pinv(lhs_matrix))
+        # amps, info = linalg.gmres(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-8, x0 = sx0/gain)
         # time_end = time.perf_counter()
-        # print(amps, info)
         # print("amplitude: gmres took ", time_end - time_start, flush=True)
         # print("Min and max diff of signal amplitude", np.min(amps - true_s ), np.max(amps - true_s ), flush=True)
 
         # time_start = time.perf_counter()
-        # amps, info = linalg.minres(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3))#, rtol=1e-9, atol=1e-1)#, x0 = s0[-1])#, rtol=1e-9)# atol=1e-1)#, M = np.linalg.pinv(lhs_matrix))
+        # amps, info = linalg.minres(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-8, x0 = sx0/gain)
         # time_end = time.perf_counter()
-        # print(amps, info)
         # print("amplitude: minres took ", time_end - time_start, flush=True)
         # print("Min and max diff of signal amplitude", np.min(amps - true_s ), np.max(amps - true_s ), flush=True)
 
+        # raise SystemExit
 
         if info>0:
             warnings.warn("Warning! Amplitude info: %i" %info)
             print("drawing amplitude again", flush=True)
-            rhs_eqn = amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, mu, beam_vec_t, nside=nside, Nfreqs=len(freqs), lmax = lmax_beam, freq_beam = freq_beam)
-            amps, info = linalg.cgs(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-9)#, M = np.linalg.pinv(lhs_matrix))
+            rhs_eqn = get_amps_rhs(all_data, gain, all_covN, covA, freqs, ref_freq, beta, nside, nside_new, beam_fwhm, lmax_beam, freq_beam)
+            amps, info = linalg.cgs(A = lhs_matrix, b = rhs_eqn, maxiter=int(1e3), rtol=1e-9)
             time_end = time.perf_counter()
             print("amplitude: cgs took ", time_end - time_start, flush=True)
 
@@ -344,7 +370,7 @@ def gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes, operator, freqs, be
         # gx0 = g
 
         print("One iteration takes ", time_end - time_start_it, flush=True)    
-        if ((ii>1) and (ii % 100 == 0)):
+        if ((ii>1) and (ii % 250 == 0)):
             print("Saving iteration %i-th" %ii, flush=True)
             if sig2 == sig3:
                 np.savez(fout + "output_lnpost_a_s_partial_%i_nstart%i_new_alm%s-%i_fwhm%ideg_sig1%i_sig2%i_nside%i" %(ntimes, nstart, op_alm, ii, beam_deg, sig1, sig2, nside_new),
@@ -359,7 +385,7 @@ if __name__ == '__main__':
     ln_post, all_s, all_g, chisq, all_model_global, all_model_haslam, covG, covA = gibbs_sampling(data1, data2, covN1, covN2, covG, ntimes,
                                                          operator, freqs, beta, true_s, ref_freq, indx_ref,
                                                         beam_fwhm, nstart = nstart, file_s0 = file_s0,
-                                                        mu_g = gain.flatten(), op_alm = op_alm, nside = nside, nside_new = nside_new,
+                                                        mu_g = gain, op_alm = op_alm, nside = nside, nside_new = nside_new,
                                                         lmax_gain =lmax_gain, lmax_beam = lmax_beam, freq_beam=freq_beam)
 
     all_data = [data1, data2] #np.concatenate((data1, data2[np.newaxis, :]), axis=0)
